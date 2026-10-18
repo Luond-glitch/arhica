@@ -35,10 +35,15 @@ from werkzeug.utils import secure_filename
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BASE_DIR / "uploads"))
-DB_PATH = Path(os.getenv("DB_PATH", BASE_DIR / "arhica.db"))
+
+# Configurable database and upload locations.
+# Render environment variables override these defaults.
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "arhica.db")))
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
+
+# Create upload directories.
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-(UPLOAD_DIR / "thumbs").mkdir(exist_ok=True)
+(UPLOAD_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -167,13 +172,25 @@ def one(sql, args=()):
     return dict(r) if r else None
 
 
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    if conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0:
-        seed(conn)
-    conn.commit()
-    conn.close()
+    # Ensure the database's parent directory exists.
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Ensure upload folders exist.
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.executescript(SCHEMA)
+
+        if conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0:
+            seed(conn)
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def seed(conn):
