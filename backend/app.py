@@ -1,22 +1,25 @@
 """
-ARHICA Backend API (Flask + SQLite)
+ARHICA Backend API (Flask + PostgreSQL)
 
 Handles:
   * Stories / articles, events, videos  (CRUD, admin only for writes)
-  * Media library: image + video uploads (images auto-resized + thumbnailed)
+  * Media library: images + videos stored IN Postgres (BYTEA), images auto-resized + thumbnailed
   * Newsletter, contact, partnership and donation-intent forms
   * Simple admin authentication (signed token)
 
 Run (dev):   python app.py
-Run (prod):  gunicorn -w 3 -b 0.0.0.0:5000 app:app
+Run (prod):  gunicorn -w 2 -t 120 app:app
 """
+import hmac
 import html
+import io
+import mimetypes
 import os
 import re
-import shutil
 import smtplib
-import sqlite3
 import subprocess
+import shutil
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -24,30 +27,27 @@ from email.mime.text import MIMEText
 from functools import wraps
 from pathlib import Path
 
+import psycopg2
 import requests
 from dotenv import load_dotenv
-from flask import Flask, g, jsonify, request, send_from_directory
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from PIL import Image, ImageOps
+from psycopg2.extras import RealDictCursor
 from werkzeug.utils import secure_filename
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent
-
-# Configurable database and upload locations.
-# Render environment variables override these defaults.
-DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "arhica.db")))
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
-
-# Create upload directories.
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-(UPLOAD_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "****")  
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 TOKEN_MAX_AGE = 60 * 60 * 12  # 12hrs
 
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "info@arhica.org")
@@ -62,7 +62,8 @@ JETSMAIL_BASE_URL = os.getenv("JETSMAIL_BASE_URL", "https://api.jetsmail.net/v1"
 IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "gif"}
 VIDEO_EXT = {"mp4", "webm", "mov", "m4v"}
 DOC_EXT = {"pdf"}
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
+PIL_FORMAT = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -77,7 +78,7 @@ signer = URLSafeTimedSerializer(SECRET_KEY)
 # ───────────────────────── Database ─────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   slug TEXT UNIQUE NOT NULL,
   title TEXT NOT NULL,
   excerpt TEXT DEFAULT '',
@@ -91,7 +92,7 @@ CREATE TABLE IF NOT EXISTS posts (
   created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   slug TEXT UNIQUE NOT NULL,
   title TEXT NOT NULL,
   description TEXT DEFAULT '',
@@ -104,11 +105,11 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS videos (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   title TEXT NOT NULL,
   description TEXT DEFAULT '',
   category TEXT DEFAULT 'Story',
-  source TEXT DEFAULT 'youtube',      -- youtube | upload
+  source TEXT DEFAULT 'youtube',
   url TEXT NOT NULL,
   thumbnail TEXT DEFAULT '',
   featured INTEGER DEFAULT 0,
@@ -116,11 +117,16 @@ CREATE TABLE IF NOT EXISTS videos (
   created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS media (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  filename TEXT NOT NULL,
+  id SERIAL PRIMARY KEY,
+  filename TEXT UNIQUE NOT NULL,
   url TEXT NOT NULL,
   thumb TEXT DEFAULT '',
-  kind TEXT NOT NULL,                 -- image | video | document
+  thumb_name TEXT DEFAULT '',
+  kind TEXT NOT NULL,
+  mime TEXT DEFAULT 'application/octet-stream',
+  thumb_mime TEXT DEFAULT '',
+  data BYTEA,
+  thumb_data BYTEA,
   original_name TEXT,
   caption TEXT DEFAULT '',
   album TEXT DEFAULT 'General',
@@ -128,21 +134,26 @@ CREATE TABLE IF NOT EXISTS media (
   in_gallery INTEGER DEFAULT 1,
   created_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_media_thumb_name ON media(thumb_name);
 CREATE TABLE IF NOT EXISTS subscribers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   email TEXT UNIQUE NOT NULL, name TEXT DEFAULT '', created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   kind TEXT, name TEXT, email TEXT, organization TEXT,
   subject TEXT, message TEXT, is_read INTEGER DEFAULT 0, created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS donations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  full_name TEXT, email TEXT, phone TEXT, amount REAL,
+  id SERIAL PRIMARY KEY,
+  full_name TEXT, email TEXT, phone TEXT, amount DOUBLE PRECISION,
   donation_type TEXT, message TEXT, status TEXT DEFAULT 'intent', created_at TEXT
 );
 """
+
+# Columns to select for media listings (never pull the heavy BYTEA columns)
+MEDIA_COLS = ("id, filename, url, thumb, kind, mime, original_name, caption, "
+              "album, size, in_gallery, created_at")
 
 
 def now():
@@ -151,8 +162,7 @@ def now():
 
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return g.db
 
 
@@ -160,40 +170,50 @@ def db():
 def close_db(_exc):
     conn = g.pop("db", None)
     if conn:
-        conn.close()
+        try:
+            conn.rollback()  # discard anything uncommitted
+        finally:
+            conn.close()
+
+
+def execute(sql, args=()):
+    cur = db().cursor()
+    cur.execute(sql, args)
+    return cur
 
 
 def rows(sql, args=()):
-    return [dict(r) for r in db().execute(sql, args).fetchall()]
+    cur = execute(sql, args)
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    return out
 
 
 def one(sql, args=()):
-    r = db().execute(sql, args).fetchone()
+    cur = execute(sql, args)
+    r = cur.fetchone()
+    cur.close()
     return dict(r) if r else None
 
 
-
 def init_db():
-    # Ensure the database's parent directory exists.
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Ensure upload folders exist.
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    (UPLOAD_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
-        conn.executescript(SCHEMA)
-
-        if conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0:
-            seed(conn)
-
+        cur = conn.cursor()
+        cur.execute("SELECT pg_advisory_lock(727272)")  # avoid races between gunicorn workers
+        cur.execute(SCHEMA)
+        conn.commit()
+        cur.execute("SELECT COUNT(*) AS c FROM posts")
+        if cur.fetchone()["c"] == 0:
+            seed(cur)
+        conn.commit()
+        cur.execute("SELECT pg_advisory_unlock(727272)")
         conn.commit()
     finally:
         conn.close()
 
 
-def seed(conn):
+def seed(cur):
     """Starter content taken from the current arhica.org so the site is never empty."""
     posts = [
         ("How Youth-Led Climate Action is Transforming Lake Victoria Communities", "Climate Action",
@@ -213,13 +233,13 @@ def seed(conn):
          "Over 500 community members participated in ecosystem restoration drives, planting over 3,000 trees along Lake Victoria's shores.", 0),
     ]
     for title, cat, cover, date, excerpt, feat in posts:
-        conn.execute(
+        cur.execute(
             "INSERT INTO posts (slug,title,excerpt,body,category,cover,featured,status,published_at,created_at)"
-            " VALUES (?,?,?,?,?,?,?, 'published', ?, ?)",
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,'published',%s,%s)",
             (slugify(title), title, excerpt, excerpt, cat, cover, feat, date, now()),
         )
-    conn.execute(
-        "INSERT INTO videos (title,description,category,source,url,featured,created_at) VALUES (?,?,?,?,?,1,?)",
+    cur.execute(
+        "INSERT INTO videos (title,description,category,source,url,featured,created_at) VALUES (%s,%s,%s,%s,%s,1,%s)",
         ("ARHICA: Building Climate Resilience in the Heart of Africa",
          "An overview of ARHICA's mission, programmes and impact across the Lake Victoria Basin.",
          "Organization Story", "youtube", "https://youtu.be/N3-b7_uJGAU", now()),
@@ -234,7 +254,7 @@ def slugify(text):
 def unique_slug(table, title, exclude_id=None):
     base, slug, n = slugify(title), slugify(title), 2
     while True:
-        r = one(f"SELECT id FROM {table} WHERE slug=?", (slug,))
+        r = one(f"SELECT id FROM {table} WHERE slug=%s", (slug,))
         if not r or r["id"] == exclude_id:
             return slug
         slug = f"{base}-{n}"
@@ -265,7 +285,9 @@ def admin_required(fn):
 @app.post("/api/auth/login")
 def login():
     d = request.get_json(silent=True) or {}
-    if d.get("username") == ADMIN_USERNAME and d.get("password") == ADMIN_PASSWORD:
+    user_ok = hmac.compare_digest(str(d.get("username", "")), ADMIN_USERNAME)
+    pass_ok = bool(ADMIN_PASSWORD) and hmac.compare_digest(str(d.get("password", "")), ADMIN_PASSWORD)
+    if user_ok and pass_ok:
         return jsonify({"token": signer.dumps({"role": "admin"}), "expires_in": TOKEN_MAX_AGE})
     return jsonify({"error": "Invalid credentials"}), 401
 
@@ -276,7 +298,7 @@ def me():
     return jsonify({"ok": True})
 
 
-# ───────────────────────── Media uploads ─────────────────────────
+# ───────────────────────── Media uploads (stored in Postgres) ─────────────────────────
 def ext_of(name):
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
@@ -294,56 +316,88 @@ def save_upload(f, album="General", caption="", in_gallery=1):
         raise ValueError(f"File type .{ext} not allowed")
 
     name = f"{uuid.uuid4().hex}.{ext}"
-    path = UPLOAD_DIR / name
-    thumb = ""
+    stem = Path(name).stem
+    raw = f.read()
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    data, thumb_data, thumb_name, thumb_mime, thumb_url = raw, None, "", "", ""
 
     if kind == "image":
         try:
-            img = Image.open(f.stream)
+            img = Image.open(io.BytesIO(raw))
             img = ImageOps.exif_transpose(img)
             if ext != "gif":
                 img.thumbnail((2200, 2200))
                 if ext in ("jpg", "jpeg") and img.mode != "RGB":
                     img = img.convert("RGB")
-                img.save(path, quality=86, optimize=True)
-            else:
-                f.stream.seek(0)
-                f.save(path)
+                buf = io.BytesIO()
+                img.save(buf, PIL_FORMAT[ext], quality=86, optimize=True)
+                data = buf.getvalue()
             t = img.copy()
             t.thumbnail((640, 640))
             if t.mode not in ("RGB", "RGBA"):
                 t = t.convert("RGB")
-            t.save(UPLOAD_DIR / "thumbs" / f"{Path(name).stem}.webp", "WEBP", quality=78)
-            thumb = f"/media/thumbs/{Path(name).stem}.webp"
+            tbuf = io.BytesIO()
+            t.save(tbuf, "WEBP", quality=78)
+            thumb_data = tbuf.getvalue()
+            thumb_name, thumb_mime = f"{stem}.webp", "image/webp"
+            thumb_url = f"/media/thumbs/{thumb_name}"
         except Exception as e:  # corrupt image
             raise ValueError(f"Could not read image: {e}")
-    else:
-        f.save(path)
-        if kind == "video" and shutil.which("ffmpeg"):  # optional poster frame
-            poster = UPLOAD_DIR / "thumbs" / f"{Path(name).stem}.jpg"
-            try:
+    elif kind == "video" and shutil.which("ffmpeg"):  # optional poster frame
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src, poster = Path(tmp) / name, Path(tmp) / f"{stem}.jpg"
+                src.write_bytes(raw)
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", "1", "-i", str(path), "-frames:v", "1", "-vf", "scale=640:-2", str(poster)],
+                    ["ffmpeg", "-y", "-ss", "1", "-i", str(src), "-frames:v", "1",
+                     "-vf", "scale=640:-2", str(poster)],
                     capture_output=True, timeout=60, check=True)
-                thumb = f"/media/thumbs/{poster.name}"
-            except Exception:
-                pass
+                thumb_data = poster.read_bytes()
+                thumb_name, thumb_mime = poster.name, "image/jpeg"
+                thumb_url = f"/media/thumbs/{thumb_name}"
+        except Exception:
+            thumb_data = None
 
-    cur = db().execute(
-        "INSERT INTO media (filename,url,thumb,kind,original_name,caption,album,size,in_gallery,created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (name, f"/media/{name}", thumb, kind, original, caption, album or "General",
-         path.stat().st_size, in_gallery, now()),
+    cur = execute(
+        "INSERT INTO media (filename,url,thumb,thumb_name,kind,mime,thumb_mime,data,thumb_data,"
+        "original_name,caption,album,size,in_gallery,created_at)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (name, f"/media/{name}", thumb_url, thumb_name, kind, mime, thumb_mime,
+         psycopg2.Binary(data), psycopg2.Binary(thumb_data) if thumb_data else None,
+         original, caption, album or "General", len(data), in_gallery, now()),
     )
+    new_id = cur.fetchone()["id"]
     db().commit()
-    return one("SELECT * FROM media WHERE id=?", (cur.lastrowid,))
+    return one(f"SELECT {MEDIA_COLS} FROM media WHERE id=%s", (new_id,))
 
 
 @app.get("/media/<path:filename>")
 def serve_media(filename):
-    resp = send_from_directory(UPLOAD_DIR, filename, conditional=True)
-    resp.headers["Cache-Control"] = "public, max-age=2592000, immutable"
-    return resp
+    if filename.startswith("thumbs/"):
+        r = one("SELECT thumb_data AS data, thumb_mime AS mime FROM media WHERE thumb_name=%s",
+                (filename[len("thumbs/"):],))
+    else:
+        r = one("SELECT data, mime FROM media WHERE filename=%s", (filename,))
+    if not r or r["data"] is None:
+        return jsonify({"error": "Not found"}), 404
+
+    blob, total = bytes(r["data"]), len(r["data"])
+    headers = {"Cache-Control": "public, max-age=2592000, immutable", "Accept-Ranges": "bytes"}
+
+    rng = request.headers.get("Range")  # needed for video seeking
+    m = re.match(r"bytes=(\d*)-(\d*)", rng or "")
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+        else:  # suffix range: last N bytes
+            start, end = max(total - int(m.group(2)), 0), total - 1
+        end = min(end, total - 1)
+        if start > end:
+            return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(blob[start:end + 1], 206, headers=headers, mimetype=r["mime"])
+    return Response(blob, 200, headers=headers, mimetype=r["mime"])
 
 
 @app.post("/api/media")
@@ -368,12 +422,12 @@ def upload_media():
 def list_media():
     where, args = ["1=1"], []
     if request.args.get("kind"):
-        where.append("kind=?"); args.append(request.args["kind"])
+        where.append("kind=%s"); args.append(request.args["kind"])
     if request.args.get("album"):
-        where.append("album=?"); args.append(request.args["album"])
+        where.append("album=%s"); args.append(request.args["album"])
     if not is_admin() or request.args.get("gallery") == "1":
         where.append("in_gallery=1")
-    items = rows(f"SELECT * FROM media WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", args)
+    items = rows(f"SELECT {MEDIA_COLS} FROM media WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", args)
     albums = [r["album"] for r in rows("SELECT DISTINCT album FROM media ORDER BY album")]
     return jsonify({"items": items, "albums": albums})
 
@@ -382,27 +436,22 @@ def list_media():
 @admin_required
 def update_media(mid):
     d = request.get_json(silent=True) or {}
-    cur = one("SELECT * FROM media WHERE id=?", (mid,))
+    cur = one(f"SELECT {MEDIA_COLS} FROM media WHERE id=%s", (mid,))
     if not cur:
         return jsonify({"error": "Not found"}), 404
-    db().execute("UPDATE media SET caption=?, album=?, in_gallery=? WHERE id=?",
-                 (d.get("caption", cur["caption"]), d.get("album", cur["album"]),
-                  int(d.get("in_gallery", cur["in_gallery"])), mid))
+    execute("UPDATE media SET caption=%s, album=%s, in_gallery=%s WHERE id=%s",
+            (d.get("caption", cur["caption"]), d.get("album", cur["album"]),
+             int(d.get("in_gallery", cur["in_gallery"])), mid))
     db().commit()
-    return jsonify(one("SELECT * FROM media WHERE id=?", (mid,)))
+    return jsonify(one(f"SELECT {MEDIA_COLS} FROM media WHERE id=%s", (mid,)))
 
 
 @app.delete("/api/media/<int:mid>")
 @admin_required
 def delete_media(mid):
-    m = one("SELECT * FROM media WHERE id=?", (mid,))
-    if not m:
+    if not one("SELECT id FROM media WHERE id=%s", (mid,)):
         return jsonify({"error": "Not found"}), 404
-    for p in (UPLOAD_DIR / m["filename"],
-              UPLOAD_DIR / "thumbs" / f"{Path(m['filename']).stem}.webp",
-              UPLOAD_DIR / "thumbs" / f"{Path(m['filename']).stem}.jpg"):
-        p.unlink(missing_ok=True)
-    db().execute("DELETE FROM media WHERE id=?", (mid,))
+    execute("DELETE FROM media WHERE id=%s", (mid,))
     db().commit()
     return jsonify({"ok": True})
 
@@ -436,20 +485,23 @@ def register_crud(table, cfg):
         if not admin:
             where.append("status='published'")
         if request.args.get("category") and "category" in fields:
-            where.append("category=?"); args.append(request.args["category"])
+            where.append("category=%s"); args.append(request.args["category"])
         if request.args.get("q"):
-            where.append("title LIKE ?"); args.append(f"%{request.args['q']}%")
+            where.append("title ILIKE %s"); args.append(f"%{request.args['q']}%")
         if table == "events" and request.args.get("when") == "upcoming":
-            where.append("start_date >= date('now')")
+            where.append("start_date >= CURRENT_DATE::text")
         if table == "events" and request.args.get("when") == "past":
-            where.append("start_date < date('now')")
-        limit = min(int(request.args.get("limit", 100)), 200)
+            where.append("start_date < CURRENT_DATE::text")
+        try:
+            limit = min(int(request.args.get("limit", 100)), 200)
+        except ValueError:
+            limit = 100
         sql = f"SELECT * FROM {table}" + (f" WHERE {' AND '.join(where)}" if where else "")
-        return jsonify(rows(sql + f" ORDER BY {cfg['order']} LIMIT ?", args + [limit]))
+        return jsonify(rows(sql + f" ORDER BY {cfg['order']} LIMIT %s", args + [limit]))
 
     def get_item(key):
         col = "id" if str(key).isdigit() else "slug"
-        item = one(f"SELECT * FROM {table} WHERE {col}=?", (key,))
+        item = one(f"SELECT * FROM {table} WHERE {col}=%s", (key,))
         if not item or (item.get("status") != "published" and not is_admin()):
             return jsonify({"error": "Not found"}), 404
         return jsonify(item)
@@ -475,26 +527,28 @@ def register_crud(table, cfg):
             d["published_at"] = now()[:10]
         d["created_at"] = now()
         cols = ",".join(d)
-        cur = db().execute(f"INSERT INTO {table} ({cols}) VALUES ({','.join('?' * len(d))})", list(d.values()))
+        cur = execute(f"INSERT INTO {table} ({cols}) VALUES ({','.join(['%s'] * len(d))}) RETURNING id",
+                      list(d.values()))
+        new_id = cur.fetchone()["id"]
         db().commit()
-        return jsonify(one(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,))), 201
+        return jsonify(one(f"SELECT * FROM {table} WHERE id=%s", (new_id,))), 201
 
     @admin_required
     def update_item(iid):
-        cur = one(f"SELECT * FROM {table} WHERE id=?", (iid,))
+        cur = one(f"SELECT * FROM {table} WHERE id=%s", (iid,))
         if not cur:
             return jsonify({"error": "Not found"}), 404
         d = clean(request.get_json(silent=True) or {})
         if not d:
             return jsonify(cur)
-        sets = ",".join(f"{k}=?" for k in d)
-        db().execute(f"UPDATE {table} SET {sets} WHERE id=?", list(d.values()) + [iid])
+        sets = ",".join(f"{k}=%s" for k in d)
+        execute(f"UPDATE {table} SET {sets} WHERE id=%s", list(d.values()) + [iid])
         db().commit()
-        return jsonify(one(f"SELECT * FROM {table} WHERE id=?", (iid,)))
+        return jsonify(one(f"SELECT * FROM {table} WHERE id=%s", (iid,)))
 
     @admin_required
     def delete_item(iid):
-        db().execute(f"DELETE FROM {table} WHERE id=?", (iid,))
+        execute(f"DELETE FROM {table} WHERE id=%s", (iid,))
         db().commit()
         return jsonify({"ok": True})
 
@@ -550,9 +604,9 @@ def subscribe():
     name = (d.get("name") or "").strip()
     if not valid_email(email):
         return jsonify({"success": False, "message": "Please enter a valid email address."}), 400
-    if one("SELECT id FROM subscribers WHERE email=?", (email,)):
+    if one("SELECT id FROM subscribers WHERE email=%s", (email,)):
         return jsonify({"success": True, "message": "You are already subscribed. Thank you!"})
-    db().execute("INSERT INTO subscribers (email,name,created_at) VALUES (?,?,?)", (email, name, now()))
+    execute("INSERT INTO subscribers (email,name,created_at) VALUES (%s,%s,%s)", (email, name, now()))
     db().commit()
     if JETSMAIL_API_KEY:  # optional sync to Jetsmail
         try:
@@ -586,8 +640,8 @@ def handle_message(kind):
     subject = (d.get("subject") or d.get("interest") or "Website enquiry").strip()
     if not name or not valid_email(email) or (kind == "contact" and not message):
         return jsonify({"success": False, "message": "Name, a valid email and a message are required."}), 400
-    db().execute(
-        "INSERT INTO messages (kind,name,email,organization,subject,message,created_at) VALUES (?,?,?,?,?,?,?)",
+    execute(
+        "INSERT INTO messages (kind,name,email,organization,subject,message,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (kind, name, email, org, subject, message, now()))
     db().commit()
     send_email(CONTACT_EMAIL, f"[ARHICA {kind.title()}] {subject} — {name}", wrap_email(
@@ -605,12 +659,12 @@ def donation_intent():
     name, email, phone = (d.get("fullName") or "").strip(), (d.get("email") or "").strip(), (d.get("phone") or "").strip()
     try:
         amount = float(d.get("amount") or 0)
-    except ValueError:
+    except (ValueError, TypeError):
         amount = 0
     if not name or not valid_email(email) or not phone or amount < 10:
         return jsonify({"success": False, "message": "Name, email, phone and an amount of at least KES 10 are required."}), 400
-    db().execute(
-        "INSERT INTO donations (full_name,email,phone,amount,donation_type,message,created_at) VALUES (?,?,?,?,?,?,?)",
+    execute(
+        "INSERT INTO donations (full_name,email,phone,amount,donation_type,message,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (name, email, phone, amount, d.get("donationType", "one-time"), (d.get("message") or "")[:1000], now()))
     db().commit()
     send_email(CONTACT_EMAIL, f"Donation intent — {name} · KES {amount:,.0f}", wrap_email(
@@ -624,13 +678,13 @@ def donation_intent():
 @app.get("/api/admin/stats")
 @admin_required
 def stats():
-    count = lambda t, w="1=1": one(f"SELECT COUNT(*) c FROM {t} WHERE {w}")["c"]
+    count = lambda t, w="1=1": one(f"SELECT COUNT(*) AS c FROM {t} WHERE {w}")["c"]
     return jsonify({
         "posts": count("posts"), "events": count("events"), "videos": count("videos"),
         "images": count("media", "kind='image'"), "videoFiles": count("media", "kind='video'"),
         "subscribers": count("subscribers"), "messages": count("messages"),
         "unread": count("messages", "is_read=0"), "donations": count("donations"),
-        "donationTotal": one("SELECT COALESCE(SUM(amount),0) s FROM donations")["s"],
+        "donationTotal": float(one("SELECT COALESCE(SUM(amount),0) AS s FROM donations")["s"]),
     })
 
 
@@ -645,14 +699,14 @@ def admin_table(table):
 @app.post("/api/admin/messages/<int:mid>/read")
 @admin_required
 def mark_read(mid):
-    db().execute("UPDATE messages SET is_read=1 WHERE id=?", (mid,))
+    execute("UPDATE messages SET is_read=1 WHERE id=%s", (mid,))
     db().commit()
     return jsonify({"ok": True})
 
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ARHICA API running", "version": "2.0"})
+    return jsonify({"status": "ARHICA API running", "version": "3.0-postgres"})
 
 
 @app.errorhandler(413)
@@ -665,4 +719,4 @@ init_db()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print(f"\n🌿 ARHICA API on http://localhost:{port}  (admin: {ADMIN_USERNAME})")
-    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "true") == "true")
+    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false") == "true")
