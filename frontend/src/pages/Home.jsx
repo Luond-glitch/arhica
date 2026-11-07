@@ -17,7 +17,7 @@ export default function Home() {
     <>
       {/* HERO */}
       <section className="hero" id="home">
-        <Img src="ocharifredrick-fishing-4842611_1920.jpg" className="hero-bg" alt=""
+        <Img src="lakefishing.jpg" className="hero-bg" alt=""
           fallback="https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?w=1800&q=70" loading="eager" />
         <div className="hero-overlay" />
         <div className="container hero-content">
