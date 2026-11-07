@@ -65,7 +65,7 @@ function Login({ onLogin }) {
       <form onSubmit={submit} className="form-card light">
         <div className="login-logo"><i className="fas fa-leaf" /></div>
         <h2>ARHICA admin</h2>
-        <p className="muted">Sign in to manage stories, events, videos and media.</p>
+        <p className="muted">SIGN IN </p>
         <label>Username<input autoFocus required value={f.username} onChange={(e) => setF({ ...f, username: e.target.value })} /></label>
         <label>Password<input required type="password" value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} /></label>
         {err && <div className="form-msg err">{err}</div>}
