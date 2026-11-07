@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { NAV, SITE } from '../data/site';
 import { NewsletterForm } from './ui';
@@ -27,31 +27,70 @@ function Header() {
   const [openSub, setOpenSub] = useState(null);
   const [scrolled, setScrolled] = useState(false);
   const { pathname } = useLocation();
+  const headerRef = useRef(null);
 
+  // close menus when the page changes
   useEffect(() => { setOpen(false); setOpenSub(null); }, [pathname]);
+
+  // shrink header on scroll
   useEffect(() => {
     const on = () => setScrolled(window.scrollY > 60);
-    on(); window.addEventListener('scroll', on, { passive: true });
+    on();
+    window.addEventListener('scroll', on, { passive: true });
     return () => window.removeEventListener('scroll', on);
   }, []);
 
+  // Escape closes everything; clicking outside the header closes open dropdowns
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') { setOpen(false); setOpenSub(null); } };
+    const onClick = (e) => { if (headerRef.current && !headerRef.current.contains(e.target)) { setOpen(false); setOpenSub(null); } };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('click', onClick);
+    return () => { document.removeEventListener('keydown', onKey); document.removeEventListener('click', onClick); };
+  }, []);
+
+  // reset when resizing up to desktop (matches the 1080px CSS breakpoint)
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1081px)');
+    const on = (e) => { if (e.matches) { setOpen(false); setOpenSub(null); } };
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+
+  // stop the page scrolling behind the open mobile menu
+  useEffect(() => {
+    document.body.style.overflow = open ? 'hidden' : '';
+    return () => { document.body.style.overflow = ''; };
+  }, [open]);
+
   return (
-    <header className={`site-header ${scrolled ? 'scrolled' : ''}`}>
+    <header ref={headerRef} className={`site-header ${scrolled ? 'scrolled' : ''}`}>
       <div className="container header-row">
         <Link to="/" className="brand" aria-label="ARHICA home">
           <img src="/images/logo.jpeg" alt="" onError={(e) => (e.currentTarget.style.display = 'none')} />
           <span><b>ARHICA</b><small>{SITE.tagline}</small></span>
         </Link>
-        <button className={`burger ${open ? 'open' : ''}`} onClick={() => setOpen(!open)} aria-label="Toggle menu" aria-expanded={open}>
+        <button
+          className={`burger ${open ? 'open' : ''}`}
+          onClick={() => setOpen(!open)}
+          aria-label="Toggle menu"
+          aria-expanded={open}
+          aria-controls="main-nav"
+        >
           <span /><span /><span />
         </button>
-        <nav className={open ? 'open' : ''} aria-label="Main">
+        <nav id="main-nav" className={open ? 'open' : ''} aria-label="Main">
           <ul>
             {NAV.map((item) => (
               <li key={item.label} className={item.children ? `has-sub ${openSub === item.label ? 'open' : ''}` : ''}>
                 {item.children ? (
                   <>
-                    <button className="nav-link" onClick={() => setOpenSub(openSub === item.label ? null : item.label)} aria-haspopup="true">
+                    <button
+                      className="nav-link"
+                      onClick={() => setOpenSub(openSub === item.label ? null : item.label)}
+                      aria-haspopup="true"
+                      aria-expanded={openSub === item.label}
+                    >
                       {item.label} <i className="fas fa-chevron-down" />
                     </button>
                     <ul className="sub">
@@ -136,8 +175,10 @@ export default function Layout() {
   return (
     <>
       <a href="#main" className="skip">Skip to content</a>
-      <Topbar />
+      {/* 1. Logo + navigation on top */}
       <Header />
+      {/* 2. Location / phone / email / socials directly below it */}
+      <Topbar />
       <main id="main"><Outlet /></main>
       <Footer />
       <button className={`to-top ${top ? 'show' : ''}`} onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} aria-label="Back to top">
