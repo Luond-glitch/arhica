@@ -10,7 +10,7 @@ export default function About() {
       <PageHero label="Who we are" title="About" accent="ARHICA" text="AfriResilience Hub for Inclusive Climate Action — building resilience and leaving no one behind." />
       <section className="section">
         <div className="container split">
-          <Reveal><Slider images={['/images/arhica_board.jpeg',]} className="tall" alt="ARHICA" /></Reveal>
+          <Reveal><Slider images={['/images/arhica_board.jpeg', '/images/fishcage4.jpeg', '/images/lake 1.jpg', '/images/orange.jpg', '/images/conservation.jpg']} className="tall" alt="ARHICA" /></Reveal>
           <Reveal delay={100} className="split-text">
             <span className="tag">Our story</span>
             <h2>Rooted in Kisumu, <em>growing across Africa</em></h2>
@@ -36,7 +36,7 @@ export default function About() {
         <div className="container">
           <SectionHeader tag="The challenge" title="The problem we are solving" />
           <div className="split">
-          <Reveal><Slider images={['/images/arhica_board.jpeg',]} className="tall" alt="ARHICA" /></Reveal>
+          <Reveal><Slider images={['/images/degrade.jpg', '/images/change4.jpg', '/images/change2.jpg', '/images/change1.jpg', '/images/change1.jpg']} className="tall" alt="ARHICA" /></Reveal>
             <ul className="problem-list">
               {PROBLEMS.map((p, i) => (
                 <Reveal as="li" key={p.title} delay={i * 70}><span className="p-icon"><i className={`fas ${p.icon}`} /></span><div><strong>{p.title}</strong><span>{p.text}</span></div></Reveal>
