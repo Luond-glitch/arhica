@@ -58,7 +58,7 @@ export default function Home() {
       <section className="section">
         <div className="container split">
           <Reveal className="split-visual">
-            <Slider images={ABOUT_IMAGES} alt="ARHICA community work" className="tall" />
+            <Slider images={['/images/arhica_board.jpeg', '/images/fishcage4.jpeg', '/images/lake 1.jpg', '/images/orange.jpg', '/images/conservation.jpg']} alt="ARHICA community work" className="tall" />
             <div className="float-card"><i className="fas fa-award" /><div><b>Est. 2023</b><span>Kisumu, Kenya</span></div></div>
           </Reveal>
           <Reveal delay={120} className="split-text">
@@ -84,7 +84,7 @@ export default function Home() {
           <SectionHeader tag="The challenge" title="The problem we are solving"
             text="Climate change and socio-economic pressures threaten livelihoods across Western Kenya's Lake Victoria Basin." />
           <div className="split">
-            <Reveal><Slider images={PROBLEM_IMAGES} className="tall" alt="Climate impact" /></Reveal>
+            <Reveal><Slider images={['/images/degrade.jpg', '/images/change4.jpg', '/images/change2.jpg', '/images/change1.jpg', '/images/change1.jpg']} className="tall" alt="Climate impact" /></Reveal>
             <ul className="problem-list">
               {PROBLEMS.map((p, i) => (
                 <Reveal as="li" key={p.title} delay={i * 70}>
