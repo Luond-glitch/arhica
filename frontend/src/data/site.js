@@ -148,7 +148,7 @@ export const PROGRAMMES = [
     summary: 'ARHICA promotes climate change adaptation, environmental conservation education, leadership and governance development, youth empowerment, sustainable livelihoods, entrepreneurship, and community-based disaster risk reduction through skills transfer, mentorship, innovation and capacity building. The organization also supports institutional strengthening, research, documentation, knowledge management and climate resilience through workshops, seminars, field demonstrations and community engagement to foster sustainable development and inclusive environmental action.',
     indicators: ['Individuals trained on climate-smart practices', 'Adoption of renewable energy and sustainable behaviours', 'Community climate-action initiatives established', 'Improved disaster preparedness'],
     impact: 'Informed communities, reduced climate vulnerability and widespread sustainable practice.',
-    images: ['coming soon '],
+    images: ['fishcage6.jpeg'],
     tags: ['Mass Education', 'Inclusivity'],
     cta: { label: 'Join efforts', href: '/contact?topic=partner' },
   },
